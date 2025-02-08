@@ -1,16 +1,13 @@
 import {
   BatchGetItemCommand,
   BatchWriteItemCommand,
-  DeleteItemCommand,
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
   QueryCommand,
   QueryCommandInput,
-  QueryCommandOutput,
   TransactWriteItemsCommand,
   TransactionCanceledException,
-  UpdateItemCommand,
   ConditionalCheckFailedException,
 } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
@@ -18,10 +15,6 @@ import {
   AttributeValue,
   TransactWriteItemsCommandInput,
 } from '@aws-sdk/client-dynamodb'
-import {
-  marshall,
-  unmarshall,
-} from '@aws-sdk/util-dynamodb'
 import { monotonicFactory } from 'ulid'
 import { Readable } from 'stream'
 
@@ -185,13 +178,30 @@ export class AtomicDynamoDB
   }
 
   /**
-   * Get a single item by its key
+   * Get an item by its key
+   * @param key The database item key
+   * @returns The found item or undefined if not found
    */
   async get<T>(
     key: AtomicDbItemKey
   ): Promise<AtomicDbItem<T> | undefined> {
-    const results = await this.getMany<T>([key])
-    return results[0]
+    const command = new GetItemCommand({
+      TableName: this.tableName,
+      Key: {
+        pk: { S: key.pk },
+        sk: { S: key.sk },
+      },
+    })
+
+    const response = await this.client.send(
+      command
+    )
+
+    if (!response.Item) {
+      return undefined
+    }
+
+    return this.fromDynamoDBItem<T>(response.Item)
   }
 
   /**
