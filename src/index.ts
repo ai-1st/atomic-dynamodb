@@ -1,21 +1,26 @@
 import {
-  DynamoDBClient,
   BatchGetItemCommand,
-  QueryCommand,
-  QueryCommandInput,
-  TransactWriteItemsCommand,
   BatchWriteItemCommand,
+  DeleteItemCommand,
+  DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
-  UpdateItemCommand,
+  QueryCommand,
+  QueryCommandInput,
+  QueryCommandOutput,
+  TransactWriteItemsCommand,
+  TransactionCanceledException,
 } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
+import {
+  AttributeValue,
+  TransactWriteItemsCommandInput,
+} from '@aws-sdk/client-dynamodb'
 import {
   marshall,
   unmarshall,
 } from '@aws-sdk/util-dynamodb'
 import { monotonicFactory } from 'ulid'
-import { AttributeValue } from '@aws-sdk/client-dynamodb'
 import { Readable } from 'stream'
 
 // Error types for database operations
@@ -37,7 +42,7 @@ export interface AtomicDbItemKey {
 }
 
 /**
- * Generic database item with versioning and TTL
+ * Generic database item with TTL
  * @template T The type of data stored in the item
  */
 export interface AtomicDbItem<T>
@@ -49,7 +54,6 @@ export interface AtomicDbItem<T>
    * Epoch time in seconds after which the item will be deleted by the database
    */
   ttl?: number
-  version?: string
 }
 
 /**
@@ -77,14 +81,14 @@ export interface AtomicDbQuery {
 /**
  * Base interface for database operations
  */
-export interface AtomicDbInterface {
+export interface AtomicDbInterface<T> {
   /**
    * Get a single item by its key
    * @template T The type of data stored in the item
    * @param key The database item key
    * @returns The found item or undefined if not found
    */
-  get<T>(
+  get(
     key: AtomicDbItemKey
   ): Promise<AtomicDbItem<T> | undefined>
 
@@ -94,14 +98,16 @@ export interface AtomicDbInterface {
    * @param keys The database item keys
    * @returns Array with same length as input keys array. Each element will be the corresponding item or undefined if not found.
    */
-  getMany<T>(
+  getMany(
     keys: AtomicDbItemKey[]
   ): Promise<(AtomicDbItem<T> | undefined)[]>
 
   /**
    * Get a lock object by its key directly from the DB
+   * If the item doesn't exist, creates a new one with a version.
+   * Lock objects are separate from regular items and are used for optimistic locking.
    * @param key The database item key
-   * @returns The found lock object or undefined if not found
+   * @returns The found lock object or a new one with initial version
    */
   getLock(
     key: AtomicDbItemKey
@@ -109,22 +115,29 @@ export interface AtomicDbInterface {
 
   /**
    * Set one or multiple items using fast and cost-efficient BatchWriteItem command
+   * This operation does not perform any version checks.
+   * @param items The items to set
    */
-  set<T>(
+  set(
     items: AtomicDbItem<T>[] | AtomicDbItem<T>
   ): Promise<void>
 
   /**
-   * Set one or multiple items in a single transaction
-   * If locks are provided, they will be used for optimistic locking
+   * Set one or multiple items atomically with optimistic locking
+   * Each item requires a corresponding lock object for version checking.
+   * Lock objects are stored separately from the items and are updated with new versions after successful operations.
+   * @param items The items to set
+   * @param locks The lock objects to check versions against. Must match items one-to-one.
+   * @throws {RaceCondition} If version check fails
    */
-  setAtomic<T>(
+  setAtomic(
     items: AtomicDbItem<T>[] | AtomicDbItem<T>,
-    locks?: AtomicDbItemLock[] | AtomicDbItemLock
+    locks: AtomicDbItemLock[] | AtomicDbItemLock
   ): Promise<void>
 
   /**
    * Delete one or multiple items
+   * @param keys The keys of items to delete
    */
   delete(
     keys: AtomicDbItemKey[] | AtomicDbItemKey
@@ -132,15 +145,19 @@ export interface AtomicDbInterface {
 
   /**
    * Query items by primary key and optional sort key prefix
+   * @param query The query parameters
+   * @returns Array of matching items
    */
-  query<T>(
+  query(
     query: AtomicDbQuery
   ): Promise<AtomicDbItem<T>[]>
 
   /**
    * Stream items by primary key and optional sort key prefix
+   * @param query The query parameters
+   * @returns Readable stream of matching items
    */
-  stream<T>(
+  stream(
     query: AtomicDbQuery
   ): NodeJS.ReadableStream
 }
@@ -149,7 +166,7 @@ export interface AtomicDbInterface {
  * DynamoDB implementation of the database interface
  */
 export class AtomicDynamoDB
-  implements AtomicDbInterface
+  implements AtomicDbInterface<unknown>
 {
   private client: DynamoDBDocumentClient
   private tableName: string
@@ -254,30 +271,27 @@ export class AtomicDynamoDB
     const response = await this.client.send(
       command
     )
-    const item = response.Item
+    if (response.Item) {
+      return this.fromDynamoDBItemToLock(
+        response.Item
+      )
+    }
 
-    if (!item || !item.version?.S) {
-      // Create new item with version
-      const version = monotonicFactory()()
-      const command = new PutItemCommand({
+    // Create new lock with initial version
+    const newLock: AtomicDbItemLock = {
+      pk: key.pk,
+      sk: key.sk,
+      version: monotonicFactory()(),
+    }
+
+    await this.client.send(
+      new PutItemCommand({
         TableName: this.tableName,
-        Item: {
-          pk: { S: key.pk },
-          sk: { S: key.sk },
-          version: { S: version },
-          data: { S: JSON.stringify({}) },
-        },
+        Item: this.toDynamoDBLockItem(newLock),
       })
+    )
 
-      await this.client.send(command)
-      return { ...key, version }
-    }
-
-    return {
-      pk: item.pk.S!,
-      sk: item.sk.S!,
-      version: item.version.S!,
-    }
+    return newLock
   }
 
   /**
@@ -309,12 +323,18 @@ export class AtomicDynamoDB
           Item: {
             pk: { S: item.pk },
             sk: { S: item.sk },
-            data: {
-              S: JSON.stringify(item.data),
-            },
-            ...(item.ttl && {
-              ttl: { N: item.ttl.toString() },
-            }),
+            ...(item.data !== undefined
+              ? {
+                  data: {
+                    S: JSON.stringify(item.data),
+                  },
+                }
+              : {}),
+            ...(item.ttl
+              ? {
+                  ttl: { N: item.ttl.toString() },
+                }
+              : {}),
           },
         },
       }))
@@ -338,66 +358,68 @@ export class AtomicDynamoDB
   }
 
   /**
-   * Set one or multiple items in a single transaction
-   * If locks are provided, they will be used for optimistic locking
+   * Set items atomically with version check
+   * @template T The type of data stored in the item
+   * @param items The items to set
+   * @param locks The locks to check versions against
+   * @throws {RaceCondition} If version check fails
    */
   async setAtomic<T>(
     items: AtomicDbItem<T>[] | AtomicDbItem<T>,
-    locks?: AtomicDbItemLock[] | AtomicDbItemLock
+    locks: AtomicDbItemLock[] | AtomicDbItemLock
   ): Promise<void> {
-    const itemArray = Array.isArray(items)
+    const itemsArray = Array.isArray(items)
       ? items
       : [items]
-    const lockArray = locks
-      ? Array.isArray(locks)
-        ? locks
-        : [locks]
-      : []
+    const locksArray = Array.isArray(locks)
+      ? locks
+      : [locks]
 
-    if (itemArray.length === 0) return
+    if (itemsArray.length !== locksArray.length) {
+      throw new Error(
+        'Number of items must match number of locks'
+      )
+    }
 
-    const transactItems = itemArray.map(
-      (item, i) => {
-        const lock = lockArray[i]
-        return {
-          Update: {
-            TableName: this.tableName,
-            Key: {
-              pk: { S: item.pk },
-              sk: { S: item.sk },
-            },
-            UpdateExpression:
-              'SET #data = :data, #version = :newVersion' +
-              (item.ttl ? ', #ttl = :ttl' : ''),
-            ConditionExpression:
-              '#version = :oldVersion',
-            ExpressionAttributeNames: {
-              '#data': 'data',
-              '#version': 'version',
-              ...(item.ttl !== undefined
-                ? { '#ttl': 'ttl' }
-                : {}),
-            },
-            ExpressionAttributeValues: {
-              ':data': {
-                S: JSON.stringify(item.data),
-              },
-              ':newVersion': {
-                S: monotonicFactory()(),
-              },
-              ':oldVersion': { S: lock.version },
-              ...(item.ttl !== undefined
-                ? {
-                    ':ttl': {
-                      N: item.ttl.toString(),
-                    },
-                  }
-                : {}),
-            },
-          },
-        }
+    const newVersion = monotonicFactory()()
+    const transactItems: TransactWriteItemsCommandInput['TransactItems'] =
+      []
+
+    for (let i = 0; i < itemsArray.length; i++) {
+      const item = itemsArray[i]
+      const lock = locksArray[i]
+
+      // Update lock with version check
+      const updatedLock: AtomicDbItemLock = {
+        ...lock,
+        version: newVersion,
       }
-    )
+      transactItems.push({
+        Update: {
+          TableName: this.tableName,
+          Key: {
+            pk: { S: lock.pk },
+            sk: { S: lock.sk },
+          },
+          UpdateExpression:
+            'SET version = :newVersion',
+          ConditionExpression:
+            'version = :oldVersion',
+          ExpressionAttributeValues: {
+            ':newVersion': { S: newVersion },
+            ':oldVersion': { S: lock.version },
+          },
+        },
+      })
+
+      // Put the actual item
+      transactItems.push({
+        Put: {
+          TableName: this.tableName,
+          Item: this.toDynamoDBItem(item),
+        },
+      })
+    }
 
     try {
       await this.client.send(
@@ -405,15 +427,13 @@ export class AtomicDynamoDB
           TransactItems: transactItems,
         })
       )
-    } catch (error) {
+    } catch (e) {
       if (
-        error instanceof Error &&
-        error.name ===
-          'TransactionCanceledException'
+        e instanceof TransactionCanceledException
       ) {
         throw new RaceCondition()
       }
-      throw error
+      throw e
     }
   }
 
@@ -462,11 +482,11 @@ export class AtomicDynamoDB
   async query<T>(
     query: AtomicDbQuery
   ): Promise<AtomicDbItem<T>[]> {
-    const allItems: AtomicDbItem<T>[] = []
-    let lastEvaluatedKey:
-      | Record<string, any>
+    const results: AtomicDbItem<T>[] = []
+    let LastEvaluatedKey:
+      | Record<string, AttributeValue>
       | undefined
-    let itemCount = 0
+
     const TableName = this.tableName
 
     do {
@@ -475,74 +495,50 @@ export class AtomicDynamoDB
         KeyConditionExpression: query.sk
           ? 'pk = :p and begins_with(sk, :s)'
           : 'pk = :p',
-        ExpressionAttributeValues: marshall({
-          ':p': query.pk,
-          ...(query.sk && { ':s': query.sk }),
-        }),
-        ScanIndexForward: !(
-          query.reverse ?? false
-        ),
-        ...(query.limit && {
-          Limit: Math.min(
-            query.limit - itemCount,
-            1000
-          ),
-        }),
-        ...(lastEvaluatedKey && {
-          ExclusiveStartKey: marshall(
-            lastEvaluatedKey
-          ),
-        }),
+        ExpressionAttributeValues: {
+          ':p': { S: query.pk },
+          ...(query.sk
+            ? { ':s': { S: query.sk } }
+            : {}),
+        },
+        ...(LastEvaluatedKey
+          ? {
+              ExclusiveStartKey: LastEvaluatedKey,
+            }
+          : {}),
       }
 
       try {
         const command = new QueryCommand(params)
-        const { Items = [], LastEvaluatedKey } =
-          await this.client.send(command)
+        const response = await this.client.send(
+          command
+        )
+        const Items = response.Items || []
+        LastEvaluatedKey =
+          response.LastEvaluatedKey
 
         const pageItems = Items.map((item) =>
           this.fromDynamoDBItem<T>(item)
         )
-
-        allItems.push(...pageItems)
-        itemCount += pageItems.length
-
-        // Update the last evaluated key for the next page
-        lastEvaluatedKey = LastEvaluatedKey
-          ? unmarshall(LastEvaluatedKey)
-          : undefined
-
-        // Break if we've reached the requested limit
-        if (
-          query.limit &&
-          itemCount >= query.limit
-        ) {
-          break
-        }
+        results.push(...pageItems)
       } catch (error) {
-        console.error(
-          'Error querying items:',
-          error
-        )
         throw error
       }
-    } while (lastEvaluatedKey) // Continue until no more pages
+    } while (LastEvaluatedKey)
 
-    return allItems
+    return results
   }
 
   /**
    * Stream items by primary key and optional sort key prefix
    */
-  stream<T>(
-    query: AtomicDbQuery
-  ): NodeJS.ReadableStream {
+  stream<T>(query: AtomicDbQuery): Readable {
+    const client = this.client
     const TableName = this.tableName
     const fromDynamoDBItem =
       this.fromDynamoDBItem.bind(this)
-    const client = this.client
 
-    const stream = new Readable({
+    return new Readable({
       objectMode: true,
       async read() {
         try {
@@ -551,43 +547,32 @@ export class AtomicDynamoDB
             KeyConditionExpression: query.sk
               ? 'pk = :p and begins_with(sk, :s)'
               : 'pk = :p',
-            ExpressionAttributeValues: marshall({
-              ':p': query.pk,
-              ...(query.sk && { ':s': query.sk }),
-            }),
-            ScanIndexForward: !(
-              query.reverse ?? false
-            ),
-            ...(query.limit && {
-              Limit: query.limit,
-            }),
+            ExpressionAttributeValues: {
+              ':p': { S: query.pk },
+              ...(query.sk
+                ? { ':s': { S: query.sk } }
+                : {}),
+            },
           }
 
           const command = new QueryCommand(params)
-          const { Items = [] } =
-            await client.send(command)
+          const response = await client.send(
+            command
+          )
+          const Items = response.Items || []
 
           const items = Items.map((item) =>
             fromDynamoDBItem<T>(item)
           )
-
           for (const item of items) {
             this.push(item)
           }
-
-          // Signal end of stream
           this.push(null)
         } catch (error) {
-          console.error(
-            'Error streaming items:',
-            error
-          )
-          this.emit('error', error)
+          this.destroy(error as Error)
         }
       },
     })
-
-    return stream
   }
 
   /**
@@ -596,10 +581,33 @@ export class AtomicDynamoDB
   private fromDynamoDBItem<T>(
     item: Record<string, AttributeValue>
   ): AtomicDbItem<T> {
+    if (!item.pk?.S || !item.sk?.S) {
+      throw new Error(
+        'Invalid DynamoDB item: missing required fields'
+      )
+    }
+    return {
+      pk: item.pk.S,
+      sk: item.sk.S,
+      ...(item.data?.S
+        ? { data: JSON.parse(item.data.S) }
+        : {}),
+      ...(item.ttl?.N
+        ? { ttl: parseInt(item.ttl.N) }
+        : {}),
+    }
+  }
+
+  /**
+   * Convert DynamoDB item to lock format
+   */
+  private fromDynamoDBItemToLock(
+    item: Record<string, AttributeValue>
+  ): AtomicDbItemLock {
     if (
       !item.pk?.S ||
       !item.sk?.S ||
-      !item.data?.S
+      !item.version?.S
     ) {
       throw new Error(
         'Invalid DynamoDB item: missing required fields'
@@ -608,30 +616,42 @@ export class AtomicDynamoDB
     return {
       pk: item.pk.S,
       sk: item.sk.S,
-      data: JSON.parse(item.data.S) as T,
-      ...(item.ttl?.N
-        ? { ttl: parseInt(item.ttl.N) }
-        : {}),
+      version: item.version.S,
     }
   }
 
   /**
    * Convert our AtomicDbItem to DynamoDB format
    */
-  private toDynamoDBItem<T>(
-    item: AtomicDbItem<T>
+  private toDynamoDBItem(
+    item: AtomicDbItem<unknown>
   ): Record<string, AttributeValue> {
-    const version = item.version
-      ? { S: item.version }
-      : { S: monotonicFactory()() }
     return {
       pk: { S: item.pk },
       sk: { S: item.sk },
-      version,
-      data: { S: JSON.stringify(item.data) },
-      ...(item.ttl && {
-        ttl: { N: item.ttl.toString() },
-      }),
+      ...(item.data !== undefined
+        ? {
+            data: {
+              S: JSON.stringify(item.data),
+            },
+          }
+        : {}),
+      ...(item.ttl
+        ? { ttl: { N: item.ttl.toString() } }
+        : {}),
+    }
+  }
+
+  /**
+   * Convert our lock item to DynamoDB format
+   */
+  private toDynamoDBLockItem(
+    item: AtomicDbItemLock
+  ): Record<string, AttributeValue> {
+    return {
+      pk: { S: item.pk },
+      sk: { S: item.sk },
+      version: { S: item.version },
     }
   }
 }

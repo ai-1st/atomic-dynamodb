@@ -1,14 +1,14 @@
 # Atomic DynamoDB
 
-A TypeScript-first DynamoDB wrapper that provides atomic operations and simplified batch operations. Built on top of AWS SDK v3.
+A TypeScript library for DynamoDB that provides atomic operations with optimistic locking.
 
 ## Features
 
-- 🔒 Built-in optimistic locking
-- 🚀 Efficient batch operations (automatically handles DynamoDB limits)
-- 📝 Full TypeScript support
-- 🔄 Streaming support for large result sets
-- ⚡ Simple and intuitive API
+- **Atomic Operations**: Perform atomic updates with optimistic locking to prevent race conditions
+- **Separate Lock Objects**: Lock objects are stored separately from items, allowing for flexible locking strategies
+- **Type Safety**: Full TypeScript support with generic types for item data
+- **Streaming**: Stream query results for efficient processing of large datasets
+- **Batch Operations**: Efficient batch operations for non-atomic updates
 
 ## Installation
 
@@ -16,94 +16,60 @@ A TypeScript-first DynamoDB wrapper that provides atomic operations and simplifi
 npm install @ai-1st/atomic-dynamodb
 ```
 
-## Table Setup
+## Usage
 
-Create a DynamoDB table with the required schema using AWS CLI:
-
-```bash
-aws dynamodb create-table \
-  --table-name YOUR_TABLE_NAME \
-  --attribute-definitions \
-    AttributeName=pk,AttributeType=S \
-    AttributeName=sk,AttributeType=S \
-  --key-schema \
-    AttributeName=pk,KeyType=HASH \
-    AttributeName=sk,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST
-
-# Optional: Enable TTL if you plan to use item expiration
-aws dynamodb update-time-to-live \
-  --table-name YOUR_TABLE_NAME \
-  --time-to-live-specification \
-      "Enabled=true, AttributeName=ttl"
-```
-
-The table requires:
-
-- Partition key: `pk` (string)
-- Sort key: `sk` (string)
-- Optional TTL attribute: `ttl` (number)
-
-## Quick Start
+### Basic Setup
 
 ```typescript
-import { AtomicDynamoDB } from '@ai-1st/atomic-dynamodb'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
+import { AtomicDynamoDB } from '@ai-1st/atomic-dynamodb'
 
 const client = new DynamoDBClient({
-  region: 'us-east-1',
-})
-const db = new AtomicDynamoDB(
-  client,
-  'YourTableName'
-)
-
-// Basic CRUD
-await db.set({
-  pk: 'user:1',
-  sk: 'profile',
-  data: { name: 'Alice' },
-})
-const profile = await db.get({
-  pk: 'user:1',
-  sk: 'profile',
+  region: 'us-west-2',
 })
 
-// Batch operations
-const users = await db.getMany([
-  { pk: 'user:1', sk: 'profile' },
-  { pk: 'user:2', sk: 'profile' },
-])
-
-// Query operations
-const userPosts = await db.query({
-  pk: 'user:1',
-  sk: 'post:', // Get all items starting with "post:"
-})
-
-// Streaming for large result sets
-const stream = db.stream({ pk: 'user:1' })
-stream.on('data', (item) => console.log(item))
+const db = new AtomicDynamoDB(client, 'my-table')
 ```
 
-## Atomic Operations
-
-The package provides optimistic locking through the `setAtomic` method:
+### Simple Operations
 
 ```typescript
-// Get current version
-const lock = await db.getLock({
-  pk: 'counter',
-  sk: 'visits',
+// Set an item
+await db.set({
+  pk: 'user#123',
+  sk: 'profile',
+  data: { name: 'John', age: 30 },
 })
 
-// Update with version check
+// Get an item
+const item = await db.get({
+  pk: 'user#123',
+  sk: 'profile',
+})
+
+// Delete an item
+await db.delete({
+  pk: 'user#123',
+  sk: 'profile',
+})
+```
+
+### Atomic Operations
+
+```typescript
+// Get or create a lock for atomic operations
+const lock = await db.getLock({
+  pk: 'user#123',
+  sk: 'counter',
+})
+
+// Update item atomically
 try {
   await db.setAtomic(
     {
-      pk: 'counter',
-      sk: 'visits',
-      data: { count: 42 },
+      pk: 'user#123',
+      sk: 'counter',
+      data: { value: 42 },
     },
     lock
   )
@@ -115,82 +81,84 @@ try {
 }
 ```
 
-## Batch Operations
-
-Batch operations automatically handle DynamoDB's limits:
-
-```typescript
-// Batch write (automatically handles 25 item limit)
-await db.set([
-  {
-    pk: 'user:1',
-    sk: 'post:1',
-    data: { title: 'Hello' },
-  },
-  {
-    pk: 'user:1',
-    sk: 'post:2',
-    data: { title: 'World' },
-  },
-  // ... can handle any number of items
-])
-
-// Batch get (maintains order, handles missing items)
-const items = await db.getMany([
-  { pk: 'user:1', sk: 'post:1' },
-  { pk: 'user:1', sk: 'missing' }, // Will be undefined in result
-  { pk: 'user:1', sk: 'post:2' },
-])
-// items[1] will be undefined for missing item
-```
-
-## Design Decisions
-
-### Optimistic Locking
-
-1. Uses ULID for versioning to ensure monotonically increasing versions
-2. Versions are automatically created when getting a lock for a non-existent item
-3. Atomic updates use DynamoDB transactions to ensure consistency
-4. Failed version checks throw a `RaceCondition` error
-
-### Data Structure
-
-1. Each item requires `pk` (partition key) and `sk` (sort key)
-2. Data is stored in a separate `data` attribute as JSON
-3. Optional `ttl` attribute for item expiration
-4. Version is stored in a separate `version` attribute
-
 ### Batch Operations
 
-1. Automatically handles DynamoDB's 25-item batch limit
-2. Maintains order of results in batch gets
-3. Returns undefined for missing items rather than omitting them
-4. Uses efficient BatchWrite for non-atomic operations
+```typescript
+// Set multiple items
+await db.set([
+  {
+    pk: 'user#123',
+    sk: 'profile',
+    data: { name: 'John' },
+  },
+  {
+    pk: 'user#123',
+    sk: 'settings',
+    data: { theme: 'dark' },
+  },
+])
+
+// Get multiple items
+const items = await db.getMany([
+  { pk: 'user#123', sk: 'profile' },
+  { pk: 'user#123', sk: 'settings' },
+])
+```
 
 ### Query Operations
 
-1. Supports optional sort key prefix filtering
-2. Returns items in sort key order
-3. Provides both promise and stream interfaces
-
-## API Reference
-
-### Constructor
-
 ```typescript
-const db = new AtomicDynamoDB(client: DynamoDBClient, tableName: string)
+// Query by partition key
+const results = await db.query({
+  pk: 'user#123',
+})
+
+// Query with sort key prefix
+const results = await db.query({
+  pk: 'user#123',
+  sk: 'profile#',
+})
+
+// Stream results
+const stream = db.stream({
+  pk: 'user#123',
+})
 ```
 
-### Methods
+## Table Schema
 
-- `get<T>(key: AtomicDbItemKey): Promise<AtomicDbItem<T> | undefined>`
-- `getMany<T>(keys: AtomicDbItemKey[]): Promise<(AtomicDbItem<T> | undefined)[]>`
-- `set<T>(items: AtomicDbItem<T>[] | AtomicDbItem<T>): Promise<void>`
-- `setAtomic<T>(items: AtomicDbItem<T>[] | AtomicDbItem<T>, locks: AtomicDbItemLock[] | AtomicDbItemLock): Promise<void>`
-- `delete(keys: AtomicDbItemKey[] | AtomicDbItemKey): Promise<void>`
-- `query<T>(query: AtomicDbQuery): Promise<AtomicDbItem<T>[]>`
-- `stream<T>(query: AtomicDbQuery): NodeJS.ReadableStream`
-- `getLock(key: AtomicDbItemKey): Promise<AtomicDbItemLock>`
+Your DynamoDB table should have the following schema:
+
+- Partition Key: `pk` (String)
+- Sort Key: `sk` (String)
+
+Optional attributes:
+
+- `data` (String): JSON stringified data
+- `version` (String): Used for optimistic locking
+- `ttl` (Number): Time-to-live in epoch seconds
+
+## Optimistic Locking
+
+The library uses optimistic locking to prevent race conditions in atomic operations. Here's how it works:
+
+1. Lock objects are stored separately from the actual items
+2. Each lock object has a version that's updated on every atomic operation
+3. The `setAtomic` method requires both the item to update and its corresponding lock
+4. If the lock's version has changed since it was read, the operation fails with a `RaceCondition` error
+
+This approach allows for:
+
+- Separate versioning of locks and items
+- Multiple items to be locked independently
+- Atomic updates across multiple items
+
+## Error Handling
+
+The library throws the following errors:
+
+- `RaceCondition`: Thrown when an atomic operation fails due to concurrent modifications
+- `Error`: Standard error for invalid operations or DynamoDB errors
 
 ## License
 

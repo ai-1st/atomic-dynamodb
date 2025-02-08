@@ -4,7 +4,10 @@
     "outDir": "build",
     "declaration": true,
     "sourceMap": true,
-    "strictNullChecks": true
+    "strictNullChecks": true,
+    "lib": ["es2020", "DOM", "DOM.Iterable"],
+    "target": "es2020",
+    "module": "commonjs"
   },
   "include": ["src/**/*"],
   "exclude": ["src/**/*.test.ts"]

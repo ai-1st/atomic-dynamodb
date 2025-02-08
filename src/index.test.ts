@@ -10,8 +10,9 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 const client = new DynamoDBClient({
   region: 'us-east-1',
 })
+const TABLE_NAME = 'TEST'
 
-const db = new AtomicDynamoDB(client, 'TEST')
+const db = new AtomicDynamoDB(client, TABLE_NAME)
 
 test('basic CRUD operations', async (t) => {
   const key = { pk: 'test-crud', sk: 'item1' }
@@ -108,39 +109,52 @@ test('query operations', async (t) => {
 })
 
 test('atomic operations', async (t) => {
-  const key = { pk: 'test-atomic', sk: 'item1' }
-  await db.delete(key)
+  const itemKey = {
+    pk: 'test',
+    sk: 'counter',
+  }
+  const lockKey = {
+    pk: 'test',
+    sk: 'counter_lock',
+  }
 
-  // Get lock for non-existent item should create it
-  const initialLock = await db.getLock(key)
-  t.truthy(initialLock.version)
+  // Get lock first
+  const lock = await db.getLock(lockKey)
+  t.truthy(lock.version)
 
-  // Get lock again should return same item with same version
-  const sameLock = await db.getLock(key)
-  t.is(sameLock.version, initialLock.version)
+  // Set item with lock
+  await db.setAtomic(
+    {
+      pk: itemKey.pk,
+      sk: itemKey.sk,
+      data: { counter: 1 },
+    },
+    lock
+  )
 
-  // Update with correct version should succeed
-  await t.notThrowsAsync(async () => {
-    await db.setAtomic(
-      { ...key, data: { counter: 1 } },
-      initialLock
+  // Try to update with old version (should fail)
+  const error = await t.throwsAsync(
+    db.setAtomic(
+      {
+        pk: itemKey.pk,
+        sk: itemKey.sk,
+        data: { counter: 2 },
+      },
+      lock
     )
-  })
-
-  // Get lock after update should have new version
-  const newLock = await db.getLock(key)
-  t.not(newLock.version, initialLock.version)
-
-  // Update with old version should fail with RaceCondition
-  const error = await t.throwsAsync(async () => {
-    await db.setAtomic(
-      { ...key, data: { counter: 2 } },
-      initialLock
-    )
-  })
+  )
   t.true(error instanceof RaceCondition)
 
-  await db.delete(key)
+  // Verify item was updated but lock is separate
+  const item = await db.get<{ counter: number }>(
+    itemKey
+  )
+  t.is(item?.data?.counter, 1)
+  const newLock = await db.getLock(lockKey)
+  t.truthy(newLock.version)
+  t.not(newLock.version, lock.version)
+
+  await db.delete([lockKey, itemKey])
 })
 
 test('stream operations', async (t) => {
