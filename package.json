@@ -1,21 +1,17 @@
 {
-  "name": "@patomation/nps",
+  "name": "@ai-1st/atomic-dynamodb",
   "version": "1.0.2",
-  "description": "TypeScript NPM Package Starter",
+  "description": "A lightweight DynamoDB wrapper with single-table design support and optimistic locking.",
   "repository": {
     "type": "git",
-    "url": "git://github.com/USER/REPO_NAME.git"
+    "url": "git://github.com/ai-1st/atomic-dynamodb.git"
   },
   "public": true,
   "main": "build/index.js",
   "types": "build/index.d.ts",
   "files": [
-    "build",
-    "bin"
+    "build"
   ],
-  "bin": {
-    "nps": "bin/nps-cli.sh"
-  },
   "scripts": {
     "compile:tests": "tsc --project tsconfig.test.json",
     "compile:package": "tsc --project tsconfig.json",
@@ -35,7 +31,7 @@
   "keywords": [
     "typescript"
   ],
-  "author": "Patrick Kelly",
+  "author": "Dmitry Degtyarev",
   "license": "MIT",
   "ava": {
     "files": [
