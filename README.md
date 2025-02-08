@@ -16,6 +16,34 @@ A TypeScript-first DynamoDB wrapper that provides atomic operations and simplifi
 npm install @ai-1st/atomic-dynamodb
 ```
 
+## Table Setup
+
+Create a DynamoDB table with the required schema using AWS CLI:
+
+```bash
+aws dynamodb create-table \
+  --table-name YOUR_TABLE_NAME \
+  --attribute-definitions \
+    AttributeName=pk,AttributeType=S \
+    AttributeName=sk,AttributeType=S \
+  --key-schema \
+    AttributeName=pk,KeyType=HASH \
+    AttributeName=sk,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST
+
+# Optional: Enable TTL if you plan to use item expiration
+aws dynamodb update-time-to-live \
+  --table-name YOUR_TABLE_NAME \
+  --time-to-live-specification \
+      "Enabled=true, AttributeName=ttl"
+```
+
+The table requires:
+
+- Partition key: `pk` (string)
+- Sort key: `sk` (string)
+- Optional TTL attribute: `ttl` (number)
+
 ## Quick Start
 
 ```typescript
