@@ -14,7 +14,7 @@ A TypeScript library for DynamoDB that provides atomic operations with optimisti
 ## Installation
 
 ```bash
-npm install @ai-1st/atomic-dynamodb
+npm install atomic-dynamodb
 ```
 
 ## Usage
@@ -199,8 +199,6 @@ The library uses optimistic locking with automatic TTL management to prevent rac
 
 This approach allows for:
 
-- Separate versioning of locks and items
-- Multiple items to be locked independently
 - Atomic updates across multiple items
 - Clear separation between data and lock storage
 - Automatic cleanup of stale locks via TTL

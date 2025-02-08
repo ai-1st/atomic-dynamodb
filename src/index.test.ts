@@ -162,14 +162,14 @@ test('atomic operations with race conditions', async (t) => {
   const operation2 = async () => {
     // Add a small delay before getting lock for operation2
     await new Promise((resolve) =>
-      setTimeout(resolve, 200)
+      setTimeout(resolve, 100)
     )
 
     const lock2 = await db.getLock(lockKey)
 
     // Add a small delay before setting for operation2
     await new Promise((resolve) =>
-      setTimeout(resolve, 100)
+      setTimeout(resolve, 400)
     )
 
     await db.setAtomic(
