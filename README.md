@@ -57,18 +57,25 @@ await db.delete({
 ### Atomic Operations
 
 ```typescript
-// Get or create a lock for atomic operations
-const lock = await db.getLock({
+// Define keys for the data item and its lock
+const itemKey = {
   pk: 'user#123',
   sk: 'counter',
-})
+}
+const lockKey = {
+  pk: 'user#123',
+  sk: 'counter#lock', // Use a different sk for the lock
+}
+
+// Get or create a lock for atomic operations
+const lock = await db.getLock(lockKey)
 
 // Update item atomically
 try {
   await db.setAtomic(
     {
-      pk: 'user#123',
-      sk: 'counter',
+      pk: itemKey.pk,
+      sk: itemKey.sk,
       data: { value: 42 },
     },
     lock
@@ -76,10 +83,48 @@ try {
 } catch (e) {
   if (e instanceof RaceCondition) {
     // Handle concurrent modification
+    // You may want to:
+    // 1. Retry the operation with a new lock
+    // 2. Notify the user
+    // 3. Log the conflict
   }
   throw e
 }
+
+// Clean up (optional)
+await db.delete([lockKey, itemKey])
 ```
+
+### Best Practices for Locks
+
+1. **Separate Keys**: Always use different keys for locks and data items
+
+   ```typescript
+   // Good
+   const itemKey = { pk: 'user#123', sk: 'data' }
+   const lockKey = {
+     pk: 'user#123',
+     sk: 'data#lock',
+   }
+
+   // Bad - using same key for both
+   const key = { pk: 'user#123', sk: 'data' }
+   ```
+
+2. **Consistent Naming**: Use a predictable pattern for lock keys
+
+   ```typescript
+   // Examples:
+   sk: 'profile#lock' // For profile data
+   sk: 'settings#lock' // For settings data
+   sk: 'counter#lock' // For counter data
+   ```
+
+3. **Clean Up**: Remember to delete locks when they're no longer needed
+   ```typescript
+   // Clean up both the data and lock
+   await db.delete([itemKey, lockKey])
+   ```
 
 ### Batch Operations
 
@@ -135,14 +180,14 @@ Your DynamoDB table should have the following schema:
 Optional attributes:
 
 - `data` (String): JSON stringified data
-- `version` (String): Used for optimistic locking
+- `version` (String): Used for optimistic locking (only on lock items)
 - `ttl` (Number): Time-to-live in epoch seconds
 
 ## Optimistic Locking
 
 The library uses optimistic locking to prevent race conditions in atomic operations. Here's how it works:
 
-1. Lock objects are stored separately from the actual items
+1. Lock objects are stored separately from the actual items using different sort keys
 2. Each lock object has a version that's updated on every atomic operation
 3. The `setAtomic` method requires both the item to update and its corresponding lock
 4. If the lock's version has changed since it was read, the operation fails with a `RaceCondition` error
@@ -152,6 +197,7 @@ This approach allows for:
 - Separate versioning of locks and items
 - Multiple items to be locked independently
 - Atomic updates across multiple items
+- Clear separation between data and lock storage
 
 ## Error Handling
 
