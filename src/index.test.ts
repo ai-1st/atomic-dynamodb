@@ -5,7 +5,10 @@ import {
   AtomicDbItem,
   RaceCondition,
 } from './index'
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
+import {
+  DynamoDBClient,
+  UpdateItemCommand,
+} from '@aws-sdk/client-dynamodb'
 
 const client = new DynamoDBClient({
   region: 'us-east-1',
@@ -108,53 +111,178 @@ test('query operations', async (t) => {
   await db.delete(keys)
 })
 
-test('atomic operations', async (t) => {
+test('atomic operations with race conditions', async (t) => {
+  const db = new AtomicDynamoDB(
+    client,
+    TABLE_NAME
+  )
+
   const itemKey = {
     pk: 'test',
-    sk: 'counter',
+    sk: 'profile',
   }
   const lockKey = {
     pk: 'test',
-    sk: 'counter_lock',
+    sk: 'profile_lock',
   }
 
-  // Get lock first
+  // Get initial lock
   const lock = await db.getLock(lockKey)
-  t.truthy(lock.version)
 
-  // Set item with lock
+  // Set initial value
   await db.setAtomic(
     {
       pk: itemKey.pk,
       sk: itemKey.sk,
-      data: { counter: 1 },
+      data: { name: '' },
     },
     lock
   )
 
-  // Try to update with old version (should fail)
-  const error = await t.throwsAsync(
-    db.setAtomic(
+  // Simulate two parallel operations trying to set different names
+  const operation1 = async () => {
+    const lock1 = await db.getLock(lockKey)
+
+    // Add a longer delay for operation1 to ensure race condition
+    await new Promise((resolve) =>
+      setTimeout(resolve, 500)
+    )
+
+    await db.setAtomic(
       {
         pk: itemKey.pk,
         sk: itemKey.sk,
-        data: { counter: 2 },
+        data: { name: 'John' },
       },
-      lock
+      lock1
     )
-  )
-  t.true(error instanceof RaceCondition)
+    return 'John'
+  }
 
-  // Verify item was updated but lock is separate
-  const item = await db.get<{ counter: number }>(
-    itemKey
+  const operation2 = async () => {
+    // Add a small delay before getting lock for operation2
+    await new Promise((resolve) =>
+      setTimeout(resolve, 200)
+    )
+
+    const lock2 = await db.getLock(lockKey)
+
+    // Add a small delay before setting for operation2
+    await new Promise((resolve) =>
+      setTimeout(resolve, 100)
+    )
+
+    await db.setAtomic(
+      {
+        pk: itemKey.pk,
+        sk: itemKey.sk,
+        data: { name: 'Mary' },
+      },
+      lock2
+    )
+    return 'Mary'
+  }
+
+  // Run both operations concurrently
+  const results = await Promise.allSettled([
+    operation1(),
+    operation2(),
+  ])
+
+  // Verify that exactly one operation succeeded and one failed
+  const succeeded = results.filter(
+    (r) => r.status === 'fulfilled'
+  ).length
+  const failed = results.filter(
+    (r) => r.status === 'rejected'
+  ).length
+  t.is(
+    succeeded,
+    1,
+    'Exactly one operation should succeed'
   )
-  t.is(item?.data?.counter, 1)
-  const newLock = await db.getLock(lockKey)
-  t.truthy(newLock.version)
-  t.not(newLock.version, lock.version)
+  t.is(
+    failed,
+    1,
+    'Exactly one operation should fail'
+  )
+
+  // Verify that the failed operation was due to RaceCondition
+  const failedOp = results.find(
+    (r) => r.status === 'rejected'
+  ) as PromiseRejectedResult
+  t.true(
+    failedOp.reason instanceof RaceCondition,
+    'Failed operation should throw RaceCondition'
+  )
+
+  // Get the name that succeeded
+  const successOp = results.find(
+    (r) => r.status === 'fulfilled'
+  ) as PromiseFulfilledResult<string>
+  const expectedName = successOp.value
+
+  // Verify that exactly one name was set
+  const finalItem = await db.get<{
+    name: string
+  }>(itemKey)
+  t.is(
+    finalItem?.data?.name,
+    expectedName,
+    'Name should match the successful operation'
+  )
+  t.true(
+    ['John', 'Mary'].includes(
+      finalItem?.data?.name || ''
+    ),
+    'Name should be either John or Mary'
+  )
 
   await db.delete([lockKey, itemKey])
+})
+
+test('lock ttl updates', async (t) => {
+  const db = new AtomicDynamoDB(
+    client,
+    TABLE_NAME
+  )
+  const key = { pk: 'test-ttl', sk: 'lock' }
+
+  // First call creates lock with 24h TTL
+  const lock1 = await db.getLock(key)
+  t.truthy(lock1.ttl)
+  const now = Math.floor(Date.now() / 1000)
+  t.true(lock1.ttl! >= now + 23 * 60 * 60) // At least 23 hours in the future
+
+  // Second call with same lock should not update TTL or version
+  const lock2 = await db.getLock(key)
+  t.is(lock2.ttl, lock1.ttl)
+  t.is(lock2.version, lock1.version)
+
+  // Manually set TTL to less than 1 hour from now to force refresh
+  await client.send(
+    new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        pk: { S: key.pk },
+        sk: { S: key.sk },
+      },
+      UpdateExpression: 'SET #ttlAttr = :ttl',
+      ExpressionAttributeNames: {
+        '#ttlAttr': 'ttl',
+      },
+      ExpressionAttributeValues: {
+        ':ttl': { N: (now + 30 * 60).toString() }, // 30 minutes from now
+      },
+    })
+  )
+
+  // Third call should create new lock with fresh TTL and version
+  const lock3 = await db.getLock(key)
+  t.not(lock3.version, lock2.version)
+  t.true(lock3.ttl! >= now + 23 * 60 * 60)
+
+  await db.delete(key)
 })
 
 test('stream operations', async (t) => {

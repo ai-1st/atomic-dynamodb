@@ -10,6 +10,8 @@ import {
   QueryCommandOutput,
   TransactWriteItemsCommand,
   TransactionCanceledException,
+  UpdateItemCommand,
+  ConditionalCheckFailedException,
 } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import {
@@ -62,6 +64,7 @@ export interface AtomicDbItem<T>
 export interface AtomicDbItemLock
   extends AtomicDbItemKey {
   version: string
+  ttl?: number
 }
 
 /**
@@ -104,7 +107,8 @@ export interface AtomicDbInterface<T> {
 
   /**
    * Get a lock object by its key directly from the DB
-   * If the item doesn't exist, creates a new one with a version.
+   * If the item doesn't exist, creates a new one with a version and 24h TTL.
+   * If the item exists but TTL is less than 1h away, recreates it with a new version and 24h TTL.
    * Lock objects are separate from regular items and are used for optimistic locking.
    * @param key The database item key
    * @returns The found lock object or a new one with initial version
@@ -254,8 +258,12 @@ export class AtomicDynamoDB
   }
 
   /**
-   * Get a lock object by its key directly from the DB
-   * If the item doesn't exist, creates a new one with a version
+   * Get a lock object by its key
+   * If the item doesn't exist, creates a new one with a version and 24h TTL.
+   * If the item exists but TTL is less than 1h away, recreates it with a new version and 24h TTL.
+   * Lock objects are separate from regular items and are used for optimistic locking.
+   * @param key The database item key
+   * @returns The found lock object or a new one with initial version
    */
   async getLock(
     key: AtomicDbItemKey
@@ -271,17 +279,69 @@ export class AtomicDynamoDB
     const response = await this.client.send(
       command
     )
+    const now = Math.floor(Date.now() / 1000)
+    const ttl = now + 24 * 60 * 60 // 24 hours from now
+
     if (response.Item) {
-      return this.fromDynamoDBItemToLock(
-        response.Item
-      )
+      const existingLock =
+        this.fromDynamoDBItemToLock(response.Item)
+      const oneHourFromNow = now + 60 * 60
+
+      // If TTL is less than 1 hour away or undefined, recreate the lock
+      if (
+        !existingLock.ttl ||
+        existingLock.ttl < oneHourFromNow
+      ) {
+        try {
+          const newLock: AtomicDbItemLock = {
+            pk: key.pk,
+            sk: key.sk,
+            version: monotonicFactory()(),
+            ttl,
+          }
+
+          // Try to replace the lock with a condition that version hasn't changed
+          await this.client.send(
+            new PutItemCommand({
+              TableName: this.tableName,
+              Item: this.toDynamoDBLockItem(
+                newLock
+              ),
+              ConditionExpression:
+                '#version = :currentVersion',
+              ExpressionAttributeNames: {
+                '#version': 'version',
+              },
+              ExpressionAttributeValues: {
+                ':currentVersion': {
+                  S: existingLock.version,
+                },
+              },
+            })
+          )
+
+          return newLock
+        } catch (e) {
+          if (
+            e instanceof
+            ConditionalCheckFailedException
+          ) {
+            // Version changed, retry getting the lock
+            return this.getLock(key)
+          }
+          throw e
+        }
+      }
+
+      return existingLock
     }
 
-    // Create new lock with initial version
+    // Create new lock with initial version and TTL
     const newLock: AtomicDbItemLock = {
       pk: key.pk,
       sk: key.sk,
       version: monotonicFactory()(),
+      ttl,
     }
 
     await this.client.send(
@@ -617,6 +677,9 @@ export class AtomicDynamoDB
       pk: item.pk.S,
       sk: item.sk.S,
       version: item.version.S,
+      ttl: item.ttl?.N
+        ? parseInt(item.ttl.N)
+        : undefined,
     }
   }
 
@@ -652,6 +715,9 @@ export class AtomicDynamoDB
       pk: { S: item.pk },
       sk: { S: item.sk },
       version: { S: item.version },
+      ...(item.ttl
+        ? { ttl: { N: item.ttl.toString() } }
+        : {}),
     }
   }
 }
