@@ -1,10 +1,10 @@
 import test from 'ava'
+import { AtomicDynamoDB } from './index'
 import {
-  AtomicDynamoDB,
   AtomicDbItemKey,
   AtomicDbItem,
   RaceCondition,
-} from './index'
+} from 'atomic-db-interface'
 import {
   DynamoDBClient,
   UpdateItemCommand,
@@ -223,9 +223,10 @@ test('atomic operations with race conditions', async (t) => {
   const expectedName = successOp.value
 
   // Verify that exactly one name was set
-  const finalItem = await db.get<{
-    name: string
-  }>(itemKey)
+  const finalItem = await db.get({
+    pk: itemKey.pk,
+    sk: itemKey.sk,
+  })
   t.is(
     finalItem?.data?.name,
     expectedName,
@@ -305,10 +306,10 @@ test('stream operations', async (t) => {
 
   // Test streaming
   const stream = db.stream({ pk })
-  const streamedItems: any[] = []
+  const streamedItems: AtomicDbItem[] = []
 
-  await new Promise((resolve, reject) => {
-    stream.on('data', (item) => {
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (item: AtomicDbItem) => {
       streamedItems.push(item)
     })
     stream.on('end', resolve)

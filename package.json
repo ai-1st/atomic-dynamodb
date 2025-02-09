@@ -1,6 +1,6 @@
 {
   "name": "atomic-dynamodb",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "A lightweight DynamoDB wrapper with single-table design support and optimistic locking.",
   "repository": {
     "type": "git",
@@ -28,7 +28,12 @@
     "prettier": "prettier --write ."
   },
   "keywords": [
-    "typescript"
+    "typescript",
+    "dynamodb",
+    "atomic",
+    "optimistic locking",
+    "aws",
+    "nosql"
   ],
   "author": "Dmitry Degtyarev",
   "license": "MIT",
@@ -40,6 +45,7 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",
     "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "atomic-db-interface": "^1.0.0",
     "ulid": "^2.3.0"
   },
   "devDependencies": {
