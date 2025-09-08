@@ -17,6 +17,7 @@ import {
 } from '@aws-sdk/client-dynamodb'
 import { monotonicFactory } from 'ulid'
 import { Readable } from 'stream'
+import { gzipSync, gunzipSync } from 'zlib'
 import {
   AtomicDbInterface,
   AtomicDbItem,
@@ -27,6 +28,24 @@ import {
 } from 'atomic-db-interface'
 
 /**
+ * Configuration options for AtomicDynamoDB
+ */
+export interface AtomicDynamoDBOptions {
+  /**
+   * Whether to compress data before storing in DynamoDB.
+   * This can help reduce item size and costs, especially for large data objects.
+   * Default: false
+   */
+  compressData?: boolean
+  /**
+   * Minimum size in bytes for data to be compressed when compressData is true.
+   * Objects smaller than this threshold will not be compressed to avoid overhead.
+   * Default: 1024 (1KB)
+   */
+  compressionThreshold?: number
+}
+
+/**
  * DynamoDB implementation of the database interface
  */
 export class AtomicDynamoDB
@@ -34,14 +53,20 @@ export class AtomicDynamoDB
 {
   private client: DynamoDBDocumentClient
   private tableName: string
+  private options: AtomicDynamoDBOptions
 
   constructor(
     client: DynamoDBClient,
-    tableName: string
+    tableName: string,
+    options: AtomicDynamoDBOptions = {}
   ) {
     this.client =
       DynamoDBDocumentClient.from(client)
     this.tableName = tableName
+    this.options = {
+      compressionThreshold: 1024, // Default 1KB threshold
+      ...options
+    }
   }
 
   /**
@@ -257,22 +282,7 @@ export class AtomicDynamoDB
       )
       const batchRequests = batch.map((item) => ({
         PutRequest: {
-          Item: {
-            pk: { S: item.pk },
-            sk: { S: item.sk },
-            ...(item.data !== undefined
-              ? {
-                  data: {
-                    S: JSON.stringify(item.data),
-                  },
-                }
-              : {}),
-            ...(item.ttl
-              ? {
-                  ttl: { N: item.ttl.toString() },
-                }
-              : {}),
-          },
+          Item: this.toDynamoDBItem(item),
         },
       }))
 
@@ -513,6 +523,36 @@ export class AtomicDynamoDB
   }
 
   /**
+   * Serialize data for storage, with optional compression
+   * Returns either a string (uncompressed) or Buffer (compressed)
+   */
+  private serializeData(data: any): string | Buffer {
+    const jsonString = JSON.stringify(data)
+    
+    if (this.options.compressData && jsonString.length >= (this.options.compressionThreshold || 1024)) {
+      // Only compress if data is larger than threshold
+      return gzipSync(Buffer.from(jsonString, 'utf8'))
+    }
+    
+    return jsonString
+  }
+
+  /**
+   * Deserialize data from storage, with optional decompression
+   * Handles both string (uncompressed) and Buffer (compressed) data
+   */
+  private deserializeData(data: string | Uint8Array): any {
+    if (data instanceof Uint8Array) {
+      // Binary data - decompress it
+      const decompressed = gunzipSync(Buffer.from(data))
+      return JSON.parse(decompressed.toString('utf8'))
+    }
+    
+    // String data - parse as regular JSON
+    return JSON.parse(data as string)
+  }
+
+  /**
    * Convert DynamoDB item to our AtomicDbItem format
    */
   private fromDynamoDBItem(
@@ -523,12 +563,20 @@ export class AtomicDynamoDB
         'Invalid DynamoDB item: missing required fields'
       )
     }
+    
+    let data: any = undefined
+    if (item.data?.S) {
+      // String data (uncompressed)
+      data = this.deserializeData(item.data.S)
+    } else if (item.data?.B) {
+      // Binary data (compressed)
+      data = this.deserializeData(item.data.B)
+    }
+    
     return {
       pk: item.pk.S,
       sk: item.sk.S,
-      ...(item.data?.S
-        ? { data: JSON.parse(item.data.S) }
-        : {}),
+      ...(data !== undefined ? { data } : {}),
       ...(item.ttl?.N
         ? { ttl: parseInt(item.ttl.N) }
         : {}),
@@ -572,16 +620,22 @@ export class AtomicDynamoDB
       )
     }
 
+    let dataAttribute: { S: string } | { B: Buffer } | undefined = undefined
+    if (item.data !== undefined) {
+      const serialized = this.serializeData(item.data)
+      if (Buffer.isBuffer(serialized)) {
+        // Compressed data - store as binary
+        dataAttribute = { B: serialized }
+      } else {
+        // Uncompressed data - store as string
+        dataAttribute = { S: serialized }
+      }
+    }
+
     return {
       pk: { S: item.pk },
       sk: { S: item.sk },
-      ...(item.data !== undefined
-        ? {
-            data: {
-              S: JSON.stringify(item.data),
-            },
-          }
-        : {}),
+      ...(dataAttribute ? { data: dataAttribute } : {}),
       ...(item.ttl
         ? { ttl: { N: item.ttl.toString() } }
         : {}),

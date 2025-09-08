@@ -16,6 +16,7 @@ const client = new DynamoDBClient({
 const TABLE_NAME = 'TEST'
 
 const db = new AtomicDynamoDB(client, TABLE_NAME)
+const dbWithCompression = new AtomicDynamoDB(client, TABLE_NAME, { compressData: true })
 
 test('basic CRUD operations', async (t) => {
   const key = { pk: 'test-crud', sk: 'item1' }
@@ -381,4 +382,95 @@ test('large batch operations', async (t) => {
     deletedResults,
     Array(50).fill(undefined)
   )
+})
+
+test('data compression feature', async (t) => {
+  const key = { pk: 'test-compression', sk: 'item1' }
+  await db.delete(key)
+  await dbWithCompression.delete(key)
+
+  // Create a large data object that would benefit from compression
+  const largeData = {
+    message: 'hello world '.repeat(100), // Creates a string ~1200 characters long
+    numbers: Array.from({length: 100}, (_, i) => i),
+    repeatedData: {
+      field1: 'value1'.repeat(50),
+      field2: 'value2'.repeat(50),
+      field3: 'value3'.repeat(50),
+    }
+  }
+
+  const item = {
+    ...key,
+    data: largeData,
+  }
+
+  // Test that compressed data can be stored and retrieved correctly
+  await dbWithCompression.set(item)
+  const result = await dbWithCompression.get(key)
+  t.deepEqual(result?.data, largeData)
+
+  // Test that non-compressed data can still be read by compressed instance
+  await db.set(item)
+  const resultFromNonCompressed = await dbWithCompression.get(key)
+  t.deepEqual(resultFromNonCompressed?.data, largeData)
+
+  // Test that compressed data can be read by non-compressed instance 
+  // (this tests backward compatibility)
+  await dbWithCompression.set(item)
+  const resultFromCompressed = await db.get(key)
+  t.deepEqual(resultFromCompressed?.data, largeData)
+
+  // Test atomic operations with compression
+  const lockKey = { pk: 'test-compression', sk: 'lock1' }
+  await dbWithCompression.delete([key, lockKey])
+  
+  const lock = await dbWithCompression.getLock(lockKey)
+  const atomicItem = {
+    ...key,
+    data: { counter: 42, message: 'atomic with compression' },
+  }
+  
+  await dbWithCompression.setAtomic(atomicItem, lock)
+  const atomicResult = await dbWithCompression.get(key)
+  t.deepEqual(atomicResult?.data, atomicItem.data)
+
+  // Cleanup
+  await db.delete([key, lockKey])
+  await dbWithCompression.delete([key, lockKey])
+})
+
+test('compression enables storing large data that exceeds DynamoDB limits', async (t) => {
+  const key = { pk: 'test-large-compression', sk: 'item1' }
+  await db.delete(key)
+  await dbWithCompression.delete(key)
+
+  // Create a 1MB string of "0"s - this will compress extremely well
+  // but exceed DynamoDB's 400KB item size limit when uncompressed
+  const oneMegabyteOfZeros = '0'.repeat(1024 * 1024) // 1MB string
+  const largeItem = {
+    ...key,
+    data: { 
+      content: oneMegabyteOfZeros,
+      metadata: 'This is a 1MB string that should only work with compression'
+    },
+  }
+
+  // Test 1: Compressed client should successfully store and retrieve the large data
+  await t.notThrowsAsync(async () => {
+    await dbWithCompression.set(largeItem)
+  }, 'Compressed client should handle 1MB of data')
+
+  const compressedResult = await dbWithCompression.get(key)
+  t.truthy(compressedResult, 'Should retrieve the compressed large data')
+  t.is(compressedResult?.data.content, oneMegabyteOfZeros, 'Content should match exactly')
+  t.is(compressedResult?.data.metadata, 'This is a 1MB string that should only work with compression')
+
+  // Test 2: Non-compressed client should fail to store the large data (exceeds 400KB limit)
+  await t.throwsAsync(async () => {
+    await db.set(largeItem)
+  }, { instanceOf: Error }, 'Non-compressed client should fail with large data exceeding DynamoDB limits')
+
+  // Cleanup
+  await dbWithCompression.delete(key)
 })

@@ -29,7 +29,13 @@ const client = new DynamoDBClient({
   region: 'us-west-2',
 })
 
+// Basic usage
 const db = new AtomicDynamoDB(client, 'my-table')
+
+// With data compression (reduces storage size and costs)
+const dbWithCompression = new AtomicDynamoDB(client, 'my-table', {
+  compressData: true
+})
 ```
 
 ### Simple Operations
@@ -90,6 +96,56 @@ try {
 
 // Clean up (optional)
 await db.delete([lockKey, itemKey])
+```
+
+### Data Compression
+
+The library supports optional data compression using gzip to reduce storage size and costs:
+
+```typescript
+// Enable compression when creating the instance
+const db = new AtomicDynamoDB(client, 'my-table', {
+  compressData: true
+})
+```
+
+**How it works:**
+- When `compressData: true`, all data is compressed using gzip before storing
+- Compressed data is stored as binary attributes (B) in DynamoDB for maximum efficiency
+- Uncompressed data continues to be stored as string attributes (S)
+- Compressed data is automatically decompressed when reading
+- Backward compatibility: compressed instances can read uncompressed data and vice versa
+
+**Storage efficiency:**
+- Compressed data is stored as native binary attributes (no base64 overhead)
+- Typical compression ratios: 60-90% size reduction for structured/repetitive data
+- Reduces DynamoDB storage costs and improves read/write performance for large items
+
+**When to use compression:**
+- ✅ Large data objects (> 1KB)
+- ✅ Repetitive or structured data
+- ✅ Cost optimization for high-volume applications
+- ❌ Small objects (< 100 bytes) - compression overhead may increase size
+- ❌ Already compressed data (images, videos, etc.)
+
+**Example with large data:**
+```typescript
+const largeData = {
+  description: 'Lorem ipsum...'.repeat(100), // Large text
+  metadata: { /* complex nested object */ },
+  tags: Array.from({length: 50}, (_, i) => `tag-${i}`)
+}
+
+// Automatically compresses before storing
+await db.set({
+  pk: 'document#123',
+  sk: 'content',
+  data: largeData
+})
+
+// Automatically decompresses when reading
+const result = await db.get({ pk: 'document#123', sk: 'content' })
+// result.data === largeData (decompressed)
 ```
 
 ### Best Practices for Locks
@@ -182,7 +238,7 @@ Your DynamoDB table should have the following schema:
 
 Optional attributes:
 
-- `data` (String): JSON stringified data
+- `data` (String or Binary): JSON stringified data (String) or gzip compressed data (Binary)
 - `version` (String): Used for optimistic locking (only on lock items)
 - `ttl` (Number): Time-to-live in epoch seconds (automatically managed for locks)
 
