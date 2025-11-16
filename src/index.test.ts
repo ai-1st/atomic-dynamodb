@@ -4,6 +4,7 @@ import {
   AtomicDbItemKey,
   AtomicDbItem,
   RaceCondition,
+  AtomicDbQueueItemInput,
 } from 'atomic-db-interface'
 import {
   DynamoDBClient,
@@ -16,7 +17,11 @@ const client = new DynamoDBClient({
 const TABLE_NAME = 'TEST'
 
 const db = new AtomicDynamoDB(client, TABLE_NAME)
-const dbWithCompression = new AtomicDynamoDB(client, TABLE_NAME, { compressData: true })
+const dbWithCompression = new AtomicDynamoDB(
+  client,
+  TABLE_NAME,
+  { compressData: true }
+)
 
 test('basic CRUD operations', async (t) => {
   const key = { pk: 'test-crud', sk: 'item1' }
@@ -122,13 +127,9 @@ test('atomic operations with race conditions', async (t) => {
     pk: 'test',
     sk: 'profile',
   }
-  const lockKey = {
-    pk: 'test',
-    sk: 'profile_lock',
-  }
 
-  // Get initial lock
-  const lock = await db.getLock(lockKey)
+  // Get initial lock - now using the same key as the item
+  const lock = await db.getLock(itemKey)
 
   // Set initial value
   await db.setAtomic(
@@ -142,7 +143,7 @@ test('atomic operations with race conditions', async (t) => {
 
   // Simulate two parallel operations trying to set different names
   const operation1 = async () => {
-    const lock1 = await db.getLock(lockKey)
+    const lock1 = await db.getLock(itemKey)
 
     // Add a longer delay for operation1 to ensure race condition
     await new Promise((resolve) =>
@@ -166,7 +167,7 @@ test('atomic operations with race conditions', async (t) => {
       setTimeout(resolve, 100)
     )
 
-    const lock2 = await db.getLock(lockKey)
+    const lock2 = await db.getLock(itemKey)
 
     // Add a small delay before setting for operation2
     await new Promise((resolve) =>
@@ -240,7 +241,7 @@ test('atomic operations with race conditions', async (t) => {
     'Name should be either John or Mary'
   )
 
-  await db.delete([lockKey, itemKey])
+  await db.delete(itemKey)
 })
 
 test('lock ttl updates', async (t) => {
@@ -248,7 +249,7 @@ test('lock ttl updates', async (t) => {
     client,
     TABLE_NAME
   )
-  const key = { pk: 'test-ttl', sk: 'lock' }
+  const key = { pk: 'test-ttl', sk: 'item' }
 
   // First call creates lock with 24h TTL
   const lock1 = await db.getLock(key)
@@ -262,11 +263,12 @@ test('lock ttl updates', async (t) => {
   t.is(lock2.version, lock1.version)
 
   // Manually set TTL to less than 1 hour from now to force refresh
+  // Note: We need to update the lock key (with __LOCK__ prefix)
   await client.send(
     new UpdateItemCommand({
       TableName: TABLE_NAME,
       Key: {
-        pk: { S: key.pk },
+        pk: { S: `__LOCK__${key.pk}` },
         sk: { S: key.sk },
       },
       UpdateExpression: 'SET #ttlAttr = :ttl',
@@ -385,19 +387,25 @@ test('large batch operations', async (t) => {
 })
 
 test('data compression feature', async (t) => {
-  const key = { pk: 'test-compression', sk: 'item1' }
+  const key = {
+    pk: 'test-compression',
+    sk: 'item1',
+  }
   await db.delete(key)
   await dbWithCompression.delete(key)
 
   // Create a large data object that would benefit from compression
   const largeData = {
     message: 'hello world '.repeat(100), // Creates a string ~1200 characters long
-    numbers: Array.from({length: 100}, (_, i) => i),
+    numbers: Array.from(
+      { length: 100 },
+      (_, i) => i
+    ),
     repeatedData: {
       field1: 'value1'.repeat(50),
       field2: 'value2'.repeat(50),
       field3: 'value3'.repeat(50),
-    }
+    },
   }
 
   const item = {
@@ -412,47 +420,68 @@ test('data compression feature', async (t) => {
 
   // Test that non-compressed data can still be read by compressed instance
   await db.set(item)
-  const resultFromNonCompressed = await dbWithCompression.get(key)
-  t.deepEqual(resultFromNonCompressed?.data, largeData)
+  const resultFromNonCompressed =
+    await dbWithCompression.get(key)
+  t.deepEqual(
+    resultFromNonCompressed?.data,
+    largeData
+  )
 
-  // Test that compressed data can be read by non-compressed instance 
+  // Test that compressed data can be read by non-compressed instance
   // (this tests backward compatibility)
   await dbWithCompression.set(item)
   const resultFromCompressed = await db.get(key)
-  t.deepEqual(resultFromCompressed?.data, largeData)
+  t.deepEqual(
+    resultFromCompressed?.data,
+    largeData
+  )
 
   // Test atomic operations with compression
-  const lockKey = { pk: 'test-compression', sk: 'lock1' }
-  await dbWithCompression.delete([key, lockKey])
-  
-  const lock = await dbWithCompression.getLock(lockKey)
+  await dbWithCompression.delete(key)
+
+  const lock = await dbWithCompression.getLock(
+    key
+  )
   const atomicItem = {
     ...key,
-    data: { counter: 42, message: 'atomic with compression' },
+    data: {
+      counter: 42,
+      message: 'atomic with compression',
+    },
   }
-  
-  await dbWithCompression.setAtomic(atomicItem, lock)
-  const atomicResult = await dbWithCompression.get(key)
+
+  await dbWithCompression.setAtomic(
+    atomicItem,
+    lock
+  )
+  const atomicResult =
+    await dbWithCompression.get(key)
   t.deepEqual(atomicResult?.data, atomicItem.data)
 
   // Cleanup
-  await db.delete([key, lockKey])
-  await dbWithCompression.delete([key, lockKey])
+  await db.delete(key)
+  await dbWithCompression.delete(key)
 })
 
 test('compression enables storing large data that exceeds DynamoDB limits', async (t) => {
-  const key = { pk: 'test-large-compression', sk: 'item1' }
+  const key = {
+    pk: 'test-large-compression',
+    sk: 'item1',
+  }
   await db.delete(key)
   await dbWithCompression.delete(key)
 
   // Create a 1MB string of "0"s - this will compress extremely well
   // but exceed DynamoDB's 400KB item size limit when uncompressed
-  const oneMegabyteOfZeros = '0'.repeat(1024 * 1024) // 1MB string
+  const oneMegabyteOfZeros = '0'.repeat(
+    1024 * 1024
+  ) // 1MB string
   const largeItem = {
     ...key,
-    data: { 
+    data: {
       content: oneMegabyteOfZeros,
-      metadata: 'This is a 1MB string that should only work with compression'
+      metadata:
+        'This is a 1MB string that should only work with compression',
     },
   }
 
@@ -461,16 +490,503 @@ test('compression enables storing large data that exceeds DynamoDB limits', asyn
     await dbWithCompression.set(largeItem)
   }, 'Compressed client should handle 1MB of data')
 
-  const compressedResult = await dbWithCompression.get(key)
-  t.truthy(compressedResult, 'Should retrieve the compressed large data')
-  t.is(compressedResult?.data.content, oneMegabyteOfZeros, 'Content should match exactly')
-  t.is(compressedResult?.data.metadata, 'This is a 1MB string that should only work with compression')
+  const compressedResult =
+    await dbWithCompression.get(key)
+  t.truthy(
+    compressedResult,
+    'Should retrieve the compressed large data'
+  )
+  t.is(
+    compressedResult?.data.content,
+    oneMegabyteOfZeros,
+    'Content should match exactly'
+  )
+  t.is(
+    compressedResult?.data.metadata,
+    'This is a 1MB string that should only work with compression'
+  )
 
   // Test 2: Non-compressed client should fail to store the large data (exceeds 400KB limit)
-  await t.throwsAsync(async () => {
-    await db.set(largeItem)
-  }, { instanceOf: Error }, 'Non-compressed client should fail with large data exceeding DynamoDB limits')
+  await t.throwsAsync(
+    async () => {
+      await db.set(largeItem)
+    },
+    { instanceOf: Error },
+    'Non-compressed client should fail with large data exceeding DynamoDB limits'
+  )
 
   // Cleanup
   await dbWithCompression.delete(key)
+})
+
+test('queue operations - basic push and pull', async (t) => {
+  const queuePk = 'test-queue-basic'
+
+  // Clean up any existing queue items
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Test pushing items to queue
+  const items: AtomicDbQueueItemInput[] = [
+    {
+      pk: queuePk,
+      sk: 'task-1',
+      data: { message: 'first task' },
+    },
+    {
+      pk: queuePk,
+      sk: 'task-2',
+      data: { message: 'second task' },
+    },
+    {
+      pk: queuePk,
+      sk: 'task-3',
+      data: { message: 'third task' },
+    },
+  ]
+
+  await db.queuePush(items)
+
+  // Test pulling items from queue (should be FIFO order)
+  // In FIFO queues, items must be processed in order - can't pull next until previous is acknowledged
+  const result1 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(result1.item, 'Should pull first item')
+  t.is(
+    result1.item?.data?.message,
+    'first task',
+    'Should get first task'
+  )
+  t.true(
+    result1.item?.isProcessing,
+    'Item should be marked as processing'
+  )
+  t.truthy(
+    result1.item?.processingTimeout,
+    'Should have processing timeout'
+  )
+
+  // Can't pull second item while first is being processed (FIFO behavior)
+  const result2BeforeAck = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    result2BeforeAck.item,
+    'Should not pull second item while first is processing'
+  )
+
+  // Acknowledge first item to allow next item to be pulled
+  await db.queueAcknowledge({
+    pk: result1.item!.pk,
+    sk: result1.item!.sk,
+  })
+
+  // Now can pull second item
+  const result2 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    result2.item,
+    'Should pull second item after first is acknowledged'
+  )
+  t.is(
+    result2.item?.data?.message,
+    'second task',
+    'Should get second task'
+  )
+
+  // Can't pull third item while second is being processed
+  const result3BeforeAck = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    result3BeforeAck.item,
+    'Should not pull third item while second is processing'
+  )
+
+  // Acknowledge second item
+  await db.queueAcknowledge({
+    pk: result2.item!.pk,
+    sk: result2.item!.sk,
+  })
+
+  // Now can pull third item
+  const result3 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    result3.item,
+    'Should pull third item after second is acknowledged'
+  )
+  t.is(
+    result3.item?.data?.message,
+    'third task',
+    'Should get third task'
+  )
+
+  // Acknowledge third item
+  await db.queueAcknowledge({
+    pk: result3.item!.pk,
+    sk: result3.item!.sk,
+  })
+
+  // Queue should be empty now
+  const result4 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    result4.item,
+    'Queue should be empty after all items acknowledged'
+  )
+})
+
+test('queue operations - deduplication', async (t) => {
+  const queuePk = 'test-queue-dedup'
+
+  // Clean up any existing queue items
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Push same item multiple times (should be deduplicated by sk)
+  const item: AtomicDbQueueItemInput = {
+    pk: queuePk,
+    sk: 'unique-task',
+    data: { message: 'deduplicated task' },
+  }
+
+  await db.queuePush(item)
+  await db.queuePush(item) // Should not create duplicate
+  await db.queuePush(item) // Should not create duplicate
+
+  // Should only pull one item
+  const result1 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    result1.item,
+    'Should pull the deduplicated item'
+  )
+  t.is(
+    result1.item?.data?.message,
+    'deduplicated task'
+  )
+
+  // No more items should be available
+  const result2 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    result2.item,
+    'No duplicate items should be available'
+  )
+
+  // Clean up
+  if (result1.item) {
+    await db.queueAcknowledge({
+      pk: result1.item.pk,
+      sk: result1.item.sk,
+    })
+  }
+})
+
+test('queue operations - acknowledge and release', async (t) => {
+  const queuePk = 'test-queue-ack-release'
+
+  // Clean up any existing queue items
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Push test items
+  await db.queuePush([
+    {
+      pk: queuePk,
+      sk: 'ack-task',
+      data: { message: 'to acknowledge' },
+    },
+    {
+      pk: queuePk,
+      sk: 'release-task',
+      data: { message: 'to release' },
+    },
+  ])
+
+  // Pull first item and acknowledge it
+  const ackResult = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    ackResult.item,
+    'Should pull first item'
+  )
+
+  await db.queueAcknowledge({
+    pk: ackResult.item!.pk,
+    sk: ackResult.item!.sk,
+  })
+
+  // Pull second item and release it
+  const releaseResult = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    releaseResult.item,
+    'Should pull second item'
+  )
+
+  await db.queueRelease({
+    pk: releaseResult.item!.pk,
+    sk: releaseResult.item!.sk,
+  })
+
+  // The released item should be available again
+  const releasedItem = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    releasedItem.item,
+    'Released item should be available again'
+  )
+  t.is(
+    releasedItem.item?.data?.message,
+    'to release'
+  )
+
+  // The acknowledged item should not be available
+  const noMoreItems = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    noMoreItems.item,
+    'No more items after one was acknowledged and one pulled again'
+  )
+
+  // Clean up the remaining item
+  if (releasedItem.item) {
+    await db.queueAcknowledge({
+      pk: releasedItem.item.pk,
+      sk: releasedItem.item.sk,
+    })
+  }
+})
+
+test('queue operations - processing timeout expiration', async (t) => {
+  const queuePk = 'test-queue-timeout'
+
+  // Clean up any existing queue items
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Push a test item
+  await db.queuePush({
+    pk: queuePk,
+    sk: 'timeout-task',
+    data: { message: 'will timeout' },
+  })
+
+  // Pull with very short timeout (1 second)
+  const result1 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 1,
+  })
+  t.truthy(result1.item, 'Should pull item')
+  t.true(
+    result1.item!.processingTimeout <=
+      Math.floor(Date.now() / 1000) + 2,
+    'Should have short timeout'
+  )
+
+  // Wait for timeout to expire
+  await new Promise((resolve) =>
+    setTimeout(resolve, 1500)
+  )
+
+  // Item should be available again after timeout
+  const result2 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.truthy(
+    result2.item,
+    'Item should be available again after timeout'
+  )
+  t.is(
+    result2.item?.data?.message,
+    'will timeout'
+  )
+
+  // Clean up
+  if (result2.item) {
+    await db.queueAcknowledge({
+      pk: result2.item.pk,
+      sk: result2.item.sk,
+    })
+  }
+})
+
+test('queue operations - empty queue', async (t) => {
+  const queuePk = 'test-queue-empty'
+
+  // Ensure queue is empty
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Try to pull from empty queue
+  const result = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    result.item,
+    'Should return undefined for empty queue'
+  )
+})
+
+test('queue operations - multiple consumers', async (t) => {
+  const queuePk = 'test-queue-multi-consumer'
+
+  // Clean up any existing queue items
+  const existing = await db.query({
+    pk: `__FIFO__${queuePk}`,
+  })
+  if (existing.length > 0) {
+    await db.delete(
+      existing.map((item) => ({
+        pk: item.pk,
+        sk: item.sk,
+      }))
+    )
+  }
+
+  // Push multiple items sequentially to ensure ULID ordering
+  // (pushing in batch might cause ULIDs to be generated out of order)
+  for (let i = 0; i < 5; i++) {
+    await db.queuePush({
+      pk: queuePk,
+      sk: `task-${i}`,
+      data: { taskId: i, message: `Task ${i}` },
+    })
+    // Small delay to ensure ULIDs are generated in order
+    await new Promise((resolve) =>
+      setTimeout(resolve, 1)
+    )
+  }
+
+  // In a FIFO queue, only one consumer can process items at a time
+  // Consumers must acknowledge items before the next one can be pulled
+  // Simulate sequential processing (which is how FIFO queues work)
+  const processedItems: any[] = []
+
+  // Process all items sequentially - each must be acknowledged before next can be pulled
+  for (let i = 0; i < 5; i++) {
+    const result = await db.queuePull({
+      pk: queuePk,
+      ttlSeconds: 60,
+    })
+    t.truthy(result.item, `Should pull item ${i}`)
+    processedItems.push(result.item)
+
+    // Verify we can't pull next item while current is being processed
+    if (i < 4) {
+      const nextResult = await db.queuePull({
+        pk: queuePk,
+        ttlSeconds: 60,
+      })
+      t.falsy(
+        nextResult.item,
+        `Should not pull item ${
+          i + 1
+        } while item ${i} is processing`
+      )
+    }
+
+    // Acknowledge current item to allow next one to be pulled
+    await db.queueAcknowledge({
+      pk: result.item!.pk,
+      sk: result.item!.sk,
+    })
+  }
+
+  t.is(
+    processedItems.length,
+    5,
+    'All 5 items should be processed'
+  )
+
+  // Verify items were processed in order (FIFO)
+  const taskIds = processedItems.map(
+    (item) => item.data.taskId
+  )
+  t.deepEqual(
+    taskIds,
+    [0, 1, 2, 3, 4],
+    'Items should be processed in FIFO order'
+  )
+
+  // Queue should be empty now
+  const finalCheck = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 60,
+  })
+  t.falsy(
+    finalCheck.item,
+    'Queue should be completely empty'
+  )
 })
