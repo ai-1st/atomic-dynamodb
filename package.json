@@ -1,6 +1,6 @@
 {
   "name": "atomic-dynamodb",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "A lightweight DynamoDB wrapper with single-table design support and optimistic locking.",
   "repository": {
     "type": "git",
